@@ -39,7 +39,7 @@ file:close()
 Remember to replace "io" with the actual path to this IO library script when using require. Also, note that this script assumes the existence of readfile and writefile functions. Please make sure they are available in your runtime environment or replace them with appropriate functions.
 
 ## License
-This script is released under the MIT License.
+This script is released under the HURENSOHN License.
 
 ## Contribution
 Feel free to contribute to this project by opening issues or submitting pull requests. All contributions are welcome!
