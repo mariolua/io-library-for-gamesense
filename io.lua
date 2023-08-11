@@ -60,20 +60,25 @@ function io.open(filename, mode)
     end   
 
     -- Define a method to iterate over the lines in the file
-    function file:lines()
-        self.position = 1
-        
-        return function()
-            if self.position > #self.content then
-                return nil
-            end
-            local startPos = self.position
-            local endPos = self.content:find("\n", startPos) or #self.content
-            self.position = endPos + 1
-            
-            return self.content:sub(startPos, endPos - 1)
-        end
-    end
+	function file:lines()
+		local co = coroutine.create(function()
+			self.position = 1
+			while self.position <= #self.content do
+				local startPos = self.position
+				local endPos = self.content:find("\n", startPos) or #self.content
+				self.position = endPos + 1
+				coroutine.yield(self.content:sub(startPos, endPos - 1))
+			end
+		end)
+		return function()
+			local status, line = coroutine.resume(co)
+			if not status or not line then
+				self:close()
+				return nil
+			end
+			return line
+		end
+	end
 
     -- Define a method to write to the file
     -- str: the string to write
@@ -141,7 +146,22 @@ end
 -- filename: the name of the file to iterate over
 function io.lines(filename)
     local file = io.open(filename, "r")
-    return file:lines()
+    local co = coroutine.create(function()
+        for line in file:lines() do
+            coroutine.yield(line)
+        end
+    end)
+    return function()
+        local status, line = coroutine.resume(co)
+        if not status then
+            file:close()
+            return nil
+        end
+        if not line then
+            file:close()
+        end
+        return line
+    end
 end
 
 -- Define a function to write to the output
@@ -152,7 +172,6 @@ function io.write(...)
     if not output then
         output = io.open("output.txt", "w")
     end
-    print(str)
     output:write(str)
 end
 
