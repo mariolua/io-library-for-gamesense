@@ -1,197 +1,263 @@
---[[
-  This is an io library re-creation for gamesense.
-  It does not contain all functions of the original io library.
-]]
+-- It's a me, Mario
 
--- Define a local table to represent the io module
-local io = {}
+-- Import required libraries
+local json = require("json")
+local http = require "gamesense/http"
 
--- Define a function to open a file
--- filename: the name of the file to open
--- mode: the mode to open the file in (e.g., "r" for read, "w" for write)
-function io.open(filename, mode)
-    -- Create a table to represent the file
-    local file = {
-        mode = mode, -- The mode the file was opened in
-        position = 1, -- The current position in the file
+-- Helper function to find a value in a table
+-- @param tbl: table to search
+-- @param value: value to find
+-- @return: index of the value or nil if not found
+local function table_find(tbl, value)
+    for i, v in ipairs(tbl) do
+        if v == value then
+            return i
+        end
+    end
+    return nil
+end
+
+-- Helper function to split a string by "data: " prefix
+-- @param str: string to split
+-- @return: table of split values
+local function splitByDataPrefix(str)
+    local results = {}
+    
+    for segment in string.gmatch(str, "data: ([^\n]+)") do
+        table.insert(results, segment)
+    end
+    
+    return results
+end
+
+-- Helper function to count words in a string
+-- @param str: string to count words in
+-- @return: number of words in the string
+local function countWords(str)
+    local count = 0
+    for word in str:gmatch("%S+") do
+        count = count + 1
+    end
+    return count
+end
+
+local ENGINES = {
+    "gpt-3.5-turbo",
+    "gpt-3.5-turbo-16k",
+    "gpt-3.5-turbo-0301",
+    "gpt-3.5-turbo-0613",
+    "gpt-3.5-turbo-16k-0613",
+    "gpt-4",
+    "gpt-4-0314",
+    "gpt-4-32k",
+    "gpt-4-32k-0314",
+    "gpt-4-0613",
+    "gpt-4-32k-0613"
+}
+
+-- Chatbot class
+local Chatbot = {}
+Chatbot.__index = Chatbot
+
+-- Constructor for Chatbot class
+-- @params: various configuration parameters for the chatbot
+-- @return: an instance of the Chatbot
+function Chatbot.new(api_key, engine, timeout, max_tokens, temperature, top_p, presence_penalty, frequency_penalty, reply_count, truncate_limit, system_prompt, convo_id)
+    local self = setmetatable({}, Chatbot)
+    self.engine = engine or "gpt-3.5-turbo"
+	self.model = self.engine
+    self.api_key = api_key
+    self.system_prompt = system_prompt or "You are a dumb chatbot"
+    self.max_tokens = max_tokens or (string.find(engine, "gpt-4-32k") and 31000 or (string.find(engine, "gpt-4") and 7000 or (string.find(engine, "gpt-3.5-turbo-16k") and 15000 or 4000)))
+    self.truncate_limit = truncate_limit or (string.find(engine, "gpt-4-32k") and 30500 or (string.find(engine, "gpt-4") and 6500 or (string.find(engine, "gpt-3.5-turbo-16k") and 14500 or 3500)))
+    self.temperature = temperature or 0.5
+    self.top_p = top_p or 1.0
+    self.presence_penalty = presence_penalty or 0.0
+    self.frequency_penalty = frequency_penalty or 0.0
+    self.reply_count = reply_count or 1
+    self.timeout = timeout or 600
+    self.convo_id = convo_id or "default"
+	self.response = ''
+	self.full_response = nil
+	self.stream_done = true
+    self.conversation = {
+        default = {
+            {
+                role = "system",
+                content = system_prompt
+            }
+        }
     }
-
-    -- If the mode is any of the readable or writable modes, read the file content
-    if mode:match("[rawb]+") then
-        file.content = readfile(filename) or ""
+	local file = readfile("conversation.json")
+    if not file then
+        writefile("conversation.json", json.stringify(self.conversation))
+    else
+        self.conversation = json.parse(file)
     end
-
-    -- If the mode is any of the writable modes, clear the file content
-    if mode:match("[wb]+") then
-        file.content = ""
+    if self:get_token_count("default") > self.max_tokens then
+		return error("System prompt is too long")
     end
+    return self
+end
 
-    -- Define a method to read from the file
-    -- format: the format to read in (e.g., "*all" for all, "*n" for number)
-    function file:read(format)
-        -- If the file is not readable, throw an error
-        if not self.mode:match("[rb]+") then
-            error("File is not readable.")
-        end
-    
-        local startPos = self.position
-        local endPos
-    
-        if format == "*all" or format == "*a" then
-            endPos = #self.content
-        elseif format == "*n" then
-            local num = tonumber(self.content:match("%d+", startPos))
-            return num
-        elseif type(format) == "number" and self.mode:match("rb") then
-            endPos = startPos + format - 1
-        elseif format == "*b" then
-            local byteArray = {}
-            for i = 1, #self.content do
-                byteArray[i] = string.byte(self.content, i)
-            end
-            return byteArray
-        else
-            error("Invalid format. : [\""..format.."\"]")
-        end
-    
-        local result = self.content:sub(startPos, endPos)
-        self.position = endPos + 1
-        return result
-    end   
+function Chatbot:save_conversation(filename)
+	filename = filename or "conversation.json"
+	writefile(filename, json.stringify(self.conversation))
+end
 
-    -- Define a method to iterate over the lines in the file
-	function file:lines()
-		local co = coroutine.create(function()
-			self.position = 1
-			while self.position <= #self.content do
-				local startPos = self.position
-				local endPos = self.content:find("\n", startPos) or #self.content
-				self.position = endPos + 1
-				coroutine.yield(self.content:sub(startPos, endPos - 1))
-			end
-		end)
-		return function()
-			local status, line = coroutine.resume(co)
-			if not status or not line then
-				self:close()
-				return nil
-			end
-			return line
-		end
+function Chatbot:load_conversation(filename)
+	filename = filename or "conversation.json"
+	local file = readfile(filename)
+	if file then
+		self.conversation = json.parse(file)
 	end
+end
 
-    -- Define a method to write to the file
-    -- str: the string to write
-    function file:write(str)
-        -- If the file is not writable, throw an error
-        if not self.mode:match("[wab]+") then
-            error("File is not writable.")
-        end
+function Chatbot:add_to_conversation(message, role, convo_id)
+    table.insert(self.conversation[convo_id], {
+        role = role,
+        content = message
+    })
+end
 
-        -- If the mode is append, move the position to the end of the content
-        if self.mode:match("[ab]+") then
-            self.position = #self.content + 1
-        end
-
-        local startPos = self.position
-        local endPos = self.position + #str - 1
-
-        -- Insert the string at the current position
-        self.content = self.content:sub(1, startPos - 1) .. str .. self.content:sub(endPos + 1)
-        self.position = endPos + 1
-    end
-
-    -- Definea method to flush the file content to disk
-    function file:flush()
-        -- If the file is not writable, throw an error
-        if not self.mode:match("[wab]+") then
-            error("File is not writable.")
-        end
-        -- Write the file content to disk
-        writefile(filename, self.content)
-    end
-
-    -- Define a method to seek to a position in the file
-    -- whence: the reference point ("set", "cur", or "end")
-    -- offset: the offset from the reference point
-    function file:seek(whence, offset)
-        if whence == "set" then
-            self.position = offset + 1
-        elseif whence == "cur" then
-            self.position = self.position + offset
-        elseif whence == "end" then
-            self.position = #self.content + 1 + offset
+function Chatbot:__truncate_conversation(convo_id)
+    while true do
+        if self:get_token_count(self.convo_id) > self.truncate_limit and #self.conversation[self.convo_id] > 1 then
+            table.remove(self.conversation[self.convo_id], 1)
         else
-            error("Invalid whence.")
+            break
         end
-
-        -- Ensure the position is within the file content
-        self.position = math.max(1, math.min(self.position, #self.content + 1))
-
-        return self.position - 1
-    end
-
-    -- Define a method to close the file
-    function file:close()
-        -- If the file is writable, flush the content to disk
-        if self.mode:match("[wab]+") then
-            self:flush()
-        end
-    end
-
-    return file
-end
-
--- Define a function to iterate over the lines in a file
--- filename: the name of the file to iterate over
-function io.lines(filename)
-    local file = io.open(filename, "r")
-    local co = coroutine.create(function()
-        for line in file:lines() do
-            coroutine.yield(line)
-        end
-    end)
-    return function()
-        local status, line = coroutine.resume(co)
-        if not status then
-            file:close()
-            return nil
-        end
-        if not line then
-            file:close()
-        end
-        return line
     end
 end
 
--- Define a function to write to the output
--- ...: the values to write
-function io.write(...)
-    local args = {...}
-    local str = table.concat(args)
-    if not output then
-        output = io.open("output.txt", "w")
+function Chatbot:get_token_count(convo_id, custom_str)
+    if not table_find(ENGINES, self.engine) then
+        error("Engine " .. self.engine .. " is not supported. Select from " .. table.concat(ENGINES, ", "))
     end
-    output:write(str)
+    local num_tokens = 0
+    if custom_str then
+        num_tokens = num_tokens + 5
+        num_tokens = num_tokens + countWords(custom_str)
+        num_tokens = num_tokens + 5
+        return num_tokens
+    else
+        for _, message in ipairs(self.conversation[self.convo_id]) do
+
+			-- every message follows <im_start>{role/name}\n{content}<im_end>\n
+            num_tokens = num_tokens + 5
+            for key, value in pairs(message) do
+                num_tokens = num_tokens + countWords(value)
+
+				-- there's a name, the role is omitted
+                if key == "name" then
+
+					-- role is always required and always 1 token
+                    num_tokens = num_tokens + 5
+                end
+            end
+        end
+		-- every reply is primed with <im_start>assistant
+        num_tokens = num_tokens + 5
+        return num_tokens
+    end
 end
 
--- Define a function to read from the input
--- format: the format to read in (default to "*l")
-function io.read(format)
-    if not input then
-        input = io.open("input.txt", "r")
-    end
-    format = format or "*l"
-    return input:read(format)
+function Chatbot:get_max_tokens(convo_id)
+    return self.max_tokens - self:get_token_count(convo_id)
 end
 
--- Define a function to close the output
-function io.close()
-    if output then
-        output:close()
-        output = nil
+-- Function to ask a question to the chatbot in streaming mode
+-- @params: various parameters related to the question and configuration
+-- @return: chatbot's response if await async shit would be possible in that lua api
+function Chatbot:ask_stream(prompt, role, convo_id, model, pass_history, ...)
+    self:load_conversation()
+    if not self.conversation[self.convo_id] then
+        self:reset(convo_id, self.system_prompt)
     end
+    self:add_to_conversation(prompt, role, self.convo_id)
+    self:__truncate_conversation(self.convo_id)
+
+    local url = 'https://api.openai.com/v1/chat/completions'
+	local headers = {
+		["Content-Type"] = "application/json",
+		["Authorization"]= "Bearer ".. self.api_key
+	}
+
+	local parameters = {
+        model = model or self.engine,
+        messages = self.conversation[self.convo_id] or {prompt},
+        stream = true,
+        temperature = self.temperature,
+        top_p = self.top_p,
+        presence_penalty = self.presence_penalty,
+        frequency_penalty = self.frequency_penalty,
+        n = self.reply_count,
+        user = role,
+        max_tokens = self:get_max_tokens(self.convo_id)
+    }
+	
+	self.response = ''
+	self.stream_done = false
+
+    http.post(url, {stream_response = parameters.stream, network_timeout = 15, absolute_timeout = 15, headers = headers, body = json.stringify(parameters)}, {
+		headers_received = function(success, data)
+			-- print("got headers! Content-Type: ", data.headers["Content-Type"])
+		end,
+		data_received = function(success, data)
+			local split = splitByDataPrefix(data.body)
+			for i=1, #split do
+				if split[i] ~= '[DONE]' then
+					local resp = json.parse(split[i])
+					local token = resp.choices[1].delta.content or ''
+					self.response = self.response .. token
+				else
+					self.stream_done = true
+				end
+			end
+		end,
+		complete = function(success, response)
+			if not success or response.status ~= 200 then
+				error((response.status or '') .. " " .. (response.status_message or '') .. " " .. (response.body or ''))
+			end
+			self.full_response = self.response
+			self:add_to_conversation(self.response, 'assistant', self.convo_id)
+			self:save_conversation()
+		end
+	})
 end
 
--- Return the io module
-return io
+-- Function to ask a question to the chatbot
+-- @params: various parameters related to the question and configuration
+-- @return: chatbot's response if await async shit would be possible in that lua api
+function Chatbot:ask(prompt, role, convo_id, model, pass_history, ...)
+	role = role or 'user'
+	convo_id = convo_id or self.convo_id
+	model = model or self.model
+	pass_history = pass_history or true
+
+    local response = self:ask_stream(prompt, role, self.convo_id, model, pass_history, ...)
+	return response
+end
+
+-- Function to rollback the chatbot's conversation
+-- @params: number of messages to rollback and conversation id
+function Chatbot:rollback(n, convo_id)
+    for _ = 1, n do
+        table.remove(self.conversation[self.convo_id])
+    end
+    self:save_conversation()
+end
+
+-- Function to reset the chatbot's conversation
+-- @params: conversation id and system prompt
+function Chatbot:reset(convo_id, system_prompt)
+    self.conversation[self.convo_id] = {
+        {
+            role = "system",
+            content = system_prompt or self.system_prompt
+        }
+    }
+    self:save_conversation()
+end
+
+return Chatbot
